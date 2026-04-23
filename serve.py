@@ -43,7 +43,7 @@ WINDOW_FRAMES = 60        # 3 seconds at 20Hz
 
 # Detector thresholds — tuned conservatively to reduce false positives
 # A candidate fires when delta drops by at least this much within the window
-DELTA_DROP_THRESH   = 0.8   # normalised delta units (firmware scale)
+DELTA_DROP_THRESH   = 11 / 8  # normalised delta units (firmware scale)
 MIN_DURATION_FRAMES = 8     # ~400ms minimum event length
 COOLDOWN_FRAMES     = 40    # ~2s between candidates
 
