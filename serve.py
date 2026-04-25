@@ -105,16 +105,17 @@ class SessionState:
         deltas = [f["delta"] for f in frames]
         uS_vals = [f["uS"] for f in frames]
 
-        # Look for a drop: peak delta near the start of window, trough near the end
-        peak  = max(deltas[-WINDOW_FRAMES:])
-        trough = min(deltas[-20:])   # recent trough
+        # Use the same recent window for both peak and trough
+        recent_deltas = deltas[-40:]  # last 2 seconds
+        peak   = max(recent_deltas)
+        trough = min(recent_deltas)
 
         if peak - trough < DELTA_DROP_THRESH:
             return None
 
-        # Candidate detected — compute features
-        peak_idx   = deltas.index(peak)
-        trough_idx = len(deltas) - 1 - deltas[::-1].index(trough)
+        # Find peak and trough within the same slice
+        peak_idx   = recent_deltas.index(peak)
+        trough_idx = len(recent_deltas) - 1 - recent_deltas[::-1].index(trough)
 
         if trough_idx <= peak_idx:
             return None
@@ -124,9 +125,9 @@ class SessionState:
             return None
 
         amplitude   = max(uS_vals) - min(uS_vals[-20:])
-        attack_s    = duration_frames * 0.05 * 0.3    # rough attack estimate
+        attack_s    = duration_frames * 0.05 * 0.3
         release_s   = duration_frames * 0.05 * 0.7
-        baseline_uS = float(np.mean([f["uS"] for f in list(self.window)[:5]]))
+        baseline_uS = float(np.mean([f["uS"] for f in frames[:5]]))
 
         features = {
             "amplitude":    round(abs(amplitude), 4),
