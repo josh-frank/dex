@@ -102,38 +102,49 @@ class SessionState:
 
     def _detect(self):
         frames = list(self.window)
-        deltas = [f["delta"] for f in frames]
-        uS_vals = [f["uS"] for f in frames]
+        deltas  = [f["delta"] for f in frames]
+        uS_vals = [f["uS"]    for f in frames]
 
-        # Use the same recent window for both peak and trough
-        recent_deltas = deltas[-40:]  # last 2 seconds
-        peak   = max(recent_deltas)
-        trough = min(recent_deltas)
+        recent = deltas[-40:]  # last 2 seconds
+
+        # Find the true peak, then the trough strictly after it
+        peak_idx_r = max(range(len(recent)), key=lambda i: recent[i])
+        peak        = recent[peak_idx_r]
+
+        post_peak = recent[peak_idx_r:]
+        if len(post_peak) < MIN_DURATION_FRAMES:
+            return None
+
+        trough_idx_r = min(range(len(post_peak)), key=lambda i: post_peak[i])
+        trough        = post_peak[trough_idx_r]
 
         if peak - trough < DELTA_DROP_THRESH:
             return None
 
-        # Find peak and trough within the same slice
-        peak_idx   = recent_deltas.index(peak)
-        trough_idx = len(recent_deltas) - 1 - recent_deltas[::-1].index(trough)
-
-        if trough_idx <= peak_idx:
-            return None
-
-        duration_frames = trough_idx - peak_idx
+        duration_frames = trough_idx_r
         if duration_frames < MIN_DURATION_FRAMES:
             return None
 
-        amplitude   = max(uS_vals) - min(uS_vals[-20:])
-        attack_s    = duration_frames * 0.05 * 0.3
-        release_s   = duration_frames * 0.05 * 0.7
-        baseline_uS = float(np.mean([f["uS"] for f in frames[:5]]))
+        # Measure attack (peak → halfway down) and release (halfway → trough) for real
+        half_level = peak - (peak - trough) * 0.5
+        attack_frames = next(
+            (i for i, d in enumerate(post_peak) if d <= half_level),
+            duration_frames // 2
+        )
+        release_frames = duration_frames - attack_frames
+
+        # Baseline: tonic level BEFORE the peak, not during the event
+        pre_peak_uS = [f["uS"] for f in frames[:-(40 - peak_idx_r)]] if peak_idx_r > 0 else uS_vals[:3]
+        baseline_uS = float(np.mean(pre_peak_uS)) if pre_peak_uS else uS_vals[0]
+
+        # Amplitude in delta units (consistent, real)
+        amplitude = peak - trough
 
         features = {
-            "amplitude":    round(abs(amplitude), 4),
-            "attack_s":     round(attack_s, 3),
-            "release_s":    round(release_s, 3),
-            "baseline_uS":  round(baseline_uS, 4),
+            "amplitude":   round(abs(amplitude), 4),
+            "attack_s":    round(attack_frames * 0.05, 3),   # real seconds
+            "release_s":   round(release_frames * 0.05, 3),  # real seconds
+            "baseline_uS": round(baseline_uS, 4),
         }
 
         self.cooldown = COOLDOWN_FRAMES
