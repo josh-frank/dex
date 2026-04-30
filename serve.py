@@ -111,6 +111,13 @@ class SessionState:
         peak_idx_r = max(range(len(recent)), key=lambda i: recent[i])
         peak        = recent[peak_idx_r]
 
+        # ── hard reject heuristics ────────────────────────────────────────────
+        if max(uS_vals) > 14.0:          return None  # rail artifact
+        if peak - recent[0] < 0:         return None  # falling not rising
+        rise_s = peak_idx_r * 0.05
+        if rise_s < 0.1:                 return None  # mechanical artifact
+        # ─────────────────────────────────────────────────────────────────────
+
         post_peak = recent[peak_idx_r:]
         if len(post_peak) < MIN_DURATION_FRAMES:
             return None
@@ -125,13 +132,13 @@ class SessionState:
         if duration_frames < MIN_DURATION_FRAMES:
             return None
 
-        # Measure attack (peak → halfway down) and release (halfway → trough) for real
-        half_level = peak - (peak - trough) * 0.5
-        attack_frames = next(
+        # Measure attack (peak → half-decay) and release (half-decay → trough)
+        half_level   = peak - (peak - trough) * 0.5
+        half_frames  = next(
             (i for i, d in enumerate(post_peak) if d <= half_level),
             duration_frames // 2
         )
-        release_frames = duration_frames - attack_frames
+        release_frames = duration_frames - half_frames
 
         # Baseline: tonic level BEFORE the peak, not during the event
         pre_peak_uS = [f["uS"] for f in frames[:-(40 - peak_idx_r)]] if peak_idx_r > 0 else uS_vals[:3]
@@ -142,7 +149,7 @@ class SessionState:
 
         features = {
             "amplitude":   round(abs(amplitude), 4),
-            "attack_s":    round(attack_frames * 0.05, 3),   # real seconds
+            "attack_s":    round(half_frames * 0.05, 3),     # peak → half-decay
             "release_s":   round(release_frames * 0.05, 3),  # real seconds
             "baseline_uS": round(baseline_uS, 4),
         }
