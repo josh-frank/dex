@@ -105,52 +105,70 @@ class SessionState:
         deltas  = [f["delta"] for f in frames]
         uS_vals = [f["uS"]    for f in frames]
 
-        recent = deltas[-40:]  # last 2 seconds
+        # Use a 5-second window (100 frames at 20Hz)
+        recent = deltas[-100:]
+        uS_recent = uS_vals[-100:]
 
-        # Find the true peak, then the trough strictly after it
-        peak_idx_r = max(range(len(recent)), key=lambda i: recent[i])
-        peak        = recent[peak_idx_r]
+        if len(recent) < 20:  # need at least 1 second of data
+            return None
 
-        # ── hard reject heuristics ────────────────────────────────────────────
-        if max(uS_vals) > 14.0:          return None  # rail artifact
-        if peak - recent[0] < 0:         return None  # falling not rising
+        # Smooth the recent deltas to reduce spike sensitivity
+        smoothed_recent = np.convolve(recent, np.ones(5)/5, mode='valid')
+        peak_idx_r = np.argmax(smoothed_recent) + 2  # offset for convolution
+        peak = recent[peak_idx_r]
+
+        # ── Hard reject heuristics ────────────────────────────────────────────
+        if max(uS_recent) > 14.0:          return None  # rail artifact
+        if peak_idx_r < 5:                 return None  # peak too early (not enough pre-peak data)
+
+        # Check if the signal was rising into the peak
+        pre_peak = recent[:peak_idx_r]
+        if len(pre_peak) < 2 or (pre_peak[-1] - pre_peak[0]) <= 0:
+            return None  # not rising into the peak
+
         rise_s = peak_idx_r * 0.05
-        if rise_s < 0.1:                 return None  # mechanical artifact
-        # ─────────────────────────────────────────────────────────────────────
+        if rise_s < 0.2:                   return None  # too fast (mechanical artifact)
 
+        # Check post-peak
         post_peak = recent[peak_idx_r:]
         if len(post_peak) < MIN_DURATION_FRAMES:
             return None
 
-        trough_idx_r = min(range(len(post_peak)), key=lambda i: post_peak[i])
-        trough        = post_peak[trough_idx_r]
-
-        if peak - trough < DELTA_DROP_THRESH:
-            return None
-
+        trough_idx_r = np.argmin(post_peak)
+        trough = post_peak[trough_idx_r]
         duration_frames = trough_idx_r
+
         if duration_frames < MIN_DURATION_FRAMES:
             return None
 
-        # Measure attack (peak → half-decay) and release (half-decay → trough)
-        half_level   = peak - (peak - trough) * 0.5
-        half_frames  = next(
-            (i for i, d in enumerate(post_peak) if d <= half_level),
-            duration_frames // 2
-        )
+        # Relative amplitude check (trough must be at least 30% below peak)
+        if (peak - trough) / peak < 0.3:
+            return None
+
+        # Measure attack and release
+        half_level = peak - (peak - trough) * 0.5
+        half_frames = None
+        for i, d in enumerate(post_peak):
+            if d <= half_level:
+                prev_d = post_peak[i-1] if i > 0 else peak
+                half_frames = i - 1 + (half_level - d) / (prev_d - d)
+                break
+        if half_frames is None:
+            half_frames = duration_frames * 0.5
         release_frames = duration_frames - half_frames
 
-        # Baseline: tonic level BEFORE the peak, not during the event
-        pre_peak_uS = [f["uS"] for f in frames[:-(40 - peak_idx_r)]] if peak_idx_r > 0 else uS_vals[:3]
-        baseline_uS = float(np.mean(pre_peak_uS)) if pre_peak_uS else uS_vals[0]
+        # Robust baseline (1 second before peak)
+        pre_peak_start = max(0, peak_idx_r - 20)
+        pre_peak_uS = uS_recent[pre_peak_start:peak_idx_r]
+        baseline_uS = float(np.mean(pre_peak_uS)) if pre_peak_uS else uS_recent[0]
 
-        # Amplitude in delta units (consistent, real)
+        # Amplitude in delta units
         amplitude = peak - trough
 
         features = {
             "amplitude":   round(abs(amplitude), 4),
-            "attack_s":    round(half_frames * 0.05, 3),     # peak → half-decay
-            "release_s":   round(release_frames * 0.05, 3),  # real seconds
+            "attack_s":    round(half_frames * 0.05, 3),
+            "release_s":   round(release_frames * 0.05, 3),
             "baseline_uS": round(baseline_uS, 4),
         }
 
