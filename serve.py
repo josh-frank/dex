@@ -8,56 +8,75 @@ DEX inference server.
 Clients connect via WebSocket. The server:
   1. Receives 20Hz frames from the browser relay
      {"t": ms, "smooth_uS": float, "delta": float, "velocity": float}
-  2. Runs a sliding window detector
-  3. When a candidate event is detected, classifies it and emits:
-     {"type": "call", "label": "read"|"other", "confidence": float, "event_id": str}
+  2. Runs a two-EMA deviation detector with an armed/fire state machine
+  3. When a read is detected, emits:
+     {"type": "call", "label": "read", "confidence": float, "event_id": str, "features": {...}}
   4. Receives feedback:
      {"type": "feedback", "event_id": str, "label": bool}
      and appends to feedback.jsonl
 
 Endpoints:
   ws://host/stream   — main bidirectional channel (browser ↔ DEX)
-  GET /health        — {"status": "ok", "model": meta}
+  GET /health        — {"status": "ok", "model": "heuristic"}
+
+── How detection works ───────────────────────────────────────────────────────
+
+Two exponential moving averages track the GSR signal:
+
+  ema_slow  τ ≈ 20s   — tonic baseline (where the signal has been sitting)
+  ema_fast  τ ≈ 0.5s  — current level (responds to phasic events quickly)
+
+  deviation = ema_fast - ema_slow
+
+State machine, evaluated every frame:
+
+  IDLE  → ARMED   when deviation crosses RISE_THRESH upward
+                  (something is rising above baseline — get ready)
+
+  ARMED → FIRED   when deviation falls back to FALL_THRESH below peak_deviation
+                  (the rise has confirmed a fall — it's a read)
+                  emits the call with amplitude + duration features
+
+  FIRED → IDLE    after COOLDOWN_FRAMES (prevents re-triggering on the same event)
+
+This is essentially what a human auditor does watching the needle:
+  - notice it rising
+  - confirm it falls back
+  - call it
+
+No training data required. Tunable with three numbers.
 """
 
-import asyncio
-import collections
 import json
 import pathlib
 import time
 import uuid
 
-import joblib
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-MODEL_PATH    = pathlib.Path("dex.joblib")
-FEEDBACK_LOG  = pathlib.Path("feedback.jsonl")
-FEATURES      = ["amplitude", "attack_s", "release_s", "baseline_uS"]
+FEEDBACK_LOG = pathlib.Path("feedback.jsonl")
 
-# Sliding window — how many frames to look back when an event is detected
-WINDOW_FRAMES = 60        # 3 seconds at 20Hz
+# EMA time constants — expressed as α (per-frame smoothing factor)
+# α = 1 - exp(-1 / (τ_seconds * fps))
+FPS            = 20
+EMA_SLOW_TAU   = 20.0   # seconds — tonic baseline tracker
+EMA_FAST_TAU   = 0.5    # seconds — phasic signal tracker
+ALPHA_SLOW     = 1 - np.exp(-1 / (EMA_SLOW_TAU * FPS))   # ≈ 0.0049
+ALPHA_FAST     = 1 - np.exp(-1 / (EMA_FAST_TAU * FPS))   # ≈ 0.0952
 
-# Detector thresholds — tuned conservatively to reduce false positives
-# A candidate fires when delta drops by at least this much within the window
-DELTA_DROP_THRESH   = 11 / 8  # normalised delta units (firmware scale)
-MIN_DURATION_FRAMES = 8     # ~400ms minimum event length
-COOLDOWN_FRAMES     = 40    # ~2s between candidates
+# Detector thresholds
+RISE_THRESH    = 0.3    # µS above baseline to arm  (tune up if too noisy)
+FALL_RATIO     = 0.4    # must fall this fraction from peak to fire
+                        # e.g. 0.4 → peak of 0.5µS needs to drop back to 0.3µS
+MIN_ARMED_FRAMES = 4    # ~200ms — ignore sub-blip rises
+COOLDOWN_FRAMES  = 60   # ~3s lockout after each call
 
-# ── Load model ────────────────────────────────────────────────────────────────
-
-def load_model():
-    if not MODEL_PATH.exists():
-        print(f"[dex] {MODEL_PATH} not found — run train.py first")
-        return None, None
-    bundle = joblib.load(MODEL_PATH)
-    print(f"[dex] model loaded — meta: {bundle['meta']}")
-    return bundle["model"], bundle["meta"]
-
-model, model_meta = load_model()
+# Rail artifact rejection — signal above this is sensor saturation
+RAIL_US        = 14.0
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 
@@ -71,121 +90,114 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": model_meta}
+    return {"status": "ok", "model": "heuristic"}
 
 # ── Per-connection session state ──────────────────────────────────────────────
 
 class SessionState:
     def __init__(self):
-        self.window   = collections.deque(maxlen=WINDOW_FRAMES)
-        self.cooldown = 0          # frames remaining before next candidate allowed
-        self.pending  = {}         # event_id → candidate features (awaiting feedback)
+        self.ema_slow      = None   # initialised on first frame
+        self.ema_fast      = None
+        self.cooldown      = 0
+        self.armed         = False
+        self.armed_frames  = 0
+        self.peak_dev      = 0.0    # highest deviation seen while armed
+        self.peak_uS       = 0.0    # highest smooth_uS seen while armed
+        self.arm_time      = 0.0    # timestamp (ms) when armed
+        self.pending       = {}     # event_id → features, awaiting feedback
 
     def push(self, frame: dict):
-        """Ingest one frame. Returns a call dict if an event is detected, else None."""
-        uS      = frame.get("smooth_uS")
-        delta   = frame.get("delta")
+        """
+        Ingest one frame. Returns a features dict if a read fires, else None.
+        """
+        uS = frame.get("smooth_uS")
+        t  = frame.get("t", 0)
 
-        if uS is None or delta is None:
+        if uS is None:
             return None
 
-        self.window.append({"uS": uS, "delta": delta, "t": frame.get("t", 0)})
+        # Hard reject: sensor rail
+        if uS > RAIL_US:
+            return None
 
+        # Initialise EMAs on first frame
+        if self.ema_slow is None:
+            self.ema_slow = uS
+            self.ema_fast = uS
+            return None
+
+        # Update EMAs
+        self.ema_slow = self.ema_slow + ALPHA_SLOW * (uS - self.ema_slow)
+        self.ema_fast = self.ema_fast + ALPHA_FAST * (uS - self.ema_fast)
+
+        deviation = self.ema_fast - self.ema_slow
+
+        # Cooldown
         if self.cooldown > 0:
             self.cooldown -= 1
+            # Still track EMAs during cooldown, just don't fire
             return None
 
-        if len(self.window) < MIN_DURATION_FRAMES + 4:
-            return None
+        # ── State machine ─────────────────────────────────────────────────────
 
-        return self._detect()
+        if not self.armed:
+            # IDLE → ARMED
+            if deviation >= RISE_THRESH:
+                self.armed        = True
+                self.armed_frames = 0
+                self.peak_dev     = deviation
+                self.peak_uS      = uS
+                self.arm_time     = t
+        else:
+            # ARMED — track peak and wait for fall
+            self.armed_frames += 1
 
-    def _detect(self):
-        frames = list(self.window)
-        deltas  = [f["delta"] for f in frames]
-        uS_vals = [f["uS"]    for f in frames]
+            if deviation > self.peak_dev:
+                self.peak_dev = deviation
+                self.peak_uS  = uS
 
-        # Use a 5-second window (100 frames at 20Hz)
-        recent = deltas[-100:]
-        uS_recent = uS_vals[-100:]
+            fall_threshold = self.peak_dev * (1 - FALL_RATIO)
 
-        if len(recent) < 20:  # need at least 1 second of data
-            return None
+            if deviation <= fall_threshold:
+                # ARMED → FIRED — confirmed rise and fall
 
-        # Smooth the recent deltas to reduce spike sensitivity
-        smoothed_recent = np.convolve(recent, np.ones(5)/5, mode='valid')
-        peak_idx_r = np.argmax(smoothed_recent) + 2  # offset for convolution
-        peak = recent[peak_idx_r]
+                if self.armed_frames < MIN_ARMED_FRAMES:
+                    # Too brief — blip, not a read
+                    self.armed = False
+                    return None
 
-        # ── Hard reject heuristics ────────────────────────────────────────────
-        if max(uS_recent) > 14.0:          return None  # rail artifact
-        if peak_idx_r < 5:                 return None  # peak too early (not enough pre-peak data)
+                duration_s  = self.armed_frames / FPS
+                amplitude   = self.peak_dev            # peak deviation in µS
+                baseline_uS = float(self.ema_slow)     # tonic level at fire time
 
-        # Check if the signal was rising into the peak
-        pre_peak = recent[:peak_idx_r]
-        if len(pre_peak) < 2 or (pre_peak[-1] - pre_peak[0]) <= 0:
-            return None  # not rising into the peak
+                features = {
+                    "amplitude":   round(amplitude, 4),
+                    "duration_s":  round(duration_s, 3),
+                    "baseline_uS": round(baseline_uS, 4),
+                    "peak_uS":     round(self.peak_uS, 4),
+                }
 
-        rise_s = peak_idx_r * 0.05
-        if rise_s < 0.2:                   return None  # too fast (mechanical artifact)
+                self.armed    = False
+                self.cooldown = COOLDOWN_FRAMES
+                return features
 
-        # Check post-peak
-        post_peak = recent[peak_idx_r:]
-        if len(post_peak) < MIN_DURATION_FRAMES:
-            return None
+            # If deviation drops below zero while armed, abandon — false alarm
+            if deviation < 0:
+                self.armed = False
 
-        trough_idx_r = np.argmin(post_peak)
-        trough = post_peak[trough_idx_r]
-        duration_frames = trough_idx_r
+        return None
 
-        if duration_frames < MIN_DURATION_FRAMES:
-            return None
-
-        # Relative amplitude check (trough must be at least 30% below peak)
-        if (peak - trough) / peak < 0.3:
-            return None
-
-        # Measure attack and release
-        half_level = peak - (peak - trough) * 0.5
-        half_frames = None
-        for i, d in enumerate(post_peak):
-            if d <= half_level:
-                prev_d = post_peak[i-1] if i > 0 else peak
-                half_frames = i - 1 + (half_level - d) / (prev_d - d)
-                break
-        if half_frames is None:
-            half_frames = duration_frames * 0.5
-        release_frames = duration_frames - half_frames
-
-        # Robust baseline (1 second before peak)
-        pre_peak_start = max(0, peak_idx_r - 20)
-        pre_peak_uS = uS_recent[pre_peak_start:peak_idx_r]
-        baseline_uS = float(np.mean(pre_peak_uS)) if pre_peak_uS else uS_recent[0]
-
-        # Amplitude in delta units
-        amplitude = peak - trough
-
-        features = {
-            "amplitude":   round(abs(amplitude), 4),
-            "attack_s":    round(half_frames * 0.05, 3),
-            "release_s":   round(release_frames * 0.05, 3),
-            "baseline_uS": round(baseline_uS, 4),
-        }
-
-        self.cooldown = COOLDOWN_FRAMES
-        return features
-
-    def classify(self, features: dict) -> dict:
-        if model is None:
-            # No model yet — return candidate for labeling only
-            return {"label": "unknown", "confidence": 0.0}
-
-        X = np.array([[features[f] for f in FEATURES]])
-        prob  = model.predict_proba(X)[0]
-        pred  = int(model.predict(X)[0])
-        label = "read" if pred == 1 else "other"
-        conf  = float(prob[pred])
-        return {"label": label, "confidence": round(conf, 3)}
+    def confidence(self, features: dict) -> float:
+        """
+        Heuristic confidence score — no model required.
+        Larger amplitude relative to baseline → higher confidence.
+        Returns 0.0–1.0.
+        """
+        amp  = features["amplitude"]
+        base = max(features["baseline_uS"], 0.1)  # avoid div/0
+        # Sigmoid-ish: 0.5µS deviation = ~0.5 conf, 1.5µS = ~0.88
+        ratio = amp / base
+        return round(float(1 / (1 + np.exp(-5 * (ratio - 0.15)))), 3)
 
 
 # ── WebSocket handler ─────────────────────────────────────────────────────────
@@ -204,40 +216,42 @@ async def stream(ws: WebSocket):
             except json.JSONDecodeError:
                 continue
 
-            # ── feedback from UI ──
+            # ── feedback from UI ──────────────────────────────────────────────
             if msg.get("type") == "feedback":
                 event_id = msg.get("event_id")
                 fb_label = msg.get("label")   # true / false
                 if event_id and event_id in state.pending:
                     record = {
-                        "event_id":   event_id,
-                        "label":      fb_label,
-                        "features":   state.pending.pop(event_id),
-                        "ts":         time.time(),
+                        "event_id": event_id,
+                        "label":    fb_label,
+                        "features": state.pending.pop(event_id),
+                        "ts":       time.time(),
                     }
                     with open(FEEDBACK_LOG, "a") as f:
                         f.write(json.dumps(record) + "\n")
                     print(f"[dex] feedback saved: {event_id} → {fb_label}")
                 continue
 
-            # ── EDA frame from meter ──
-            candidate_features = state.push(msg)
-            if candidate_features is None:
+            # ── EDA frame from meter ──────────────────────────────────────────
+            features = state.push(msg)
+            if features is None:
                 continue
 
-            result     = state.classify(candidate_features)
-            event_id   = str(uuid.uuid4())[:8]
-            state.pending[event_id] = candidate_features
+            event_id = str(uuid.uuid4())[:8]
+            conf     = state.confidence(features)
+            state.pending[event_id] = features
 
             call = {
                 "type":       "call",
                 "event_id":   event_id,
-                "label":      result["label"],
-                "confidence": result["confidence"],
-                "features":   candidate_features,
+                "label":      "read",
+                "confidence": conf,
+                "features":   features,
             }
             await ws.send_text(json.dumps(call))
-            print(f"[dex] → {result['label']} ({result['confidence']:.2f})  {event_id}")
+            print(f"[dex] READ  amp={features['amplitude']:.3f}µS  "
+                  f"dur={features['duration_s']:.2f}s  "
+                  f"conf={conf:.2f}  {event_id}")
 
     except WebSocketDisconnect:
         print("[dex] client disconnected")

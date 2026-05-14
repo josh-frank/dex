@@ -214,3 +214,10 @@ COOLDOWN_FRAMES     = 40    # ~2s lockout after each candidate
 
 If DEX is firing too often (noisy), raise `DELTA_DROP_THRESH`.  
 If it's missing reads, lower it. Tune based on your feedback.jsonl patterns.
+
+<!--
+WINDOW_FRAMES       = 420
+DELTA_DROP_THRESH   = 15 / 8
+MIN_DURATION_FRAMES = 12
+COOLDOWN_FRAMES     = 60
+-->
